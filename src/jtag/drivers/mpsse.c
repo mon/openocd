@@ -52,9 +52,25 @@
 #define SIO_RESET_PURGE_RX 1
 #define SIO_RESET_PURGE_TX 2
 
+/* Optionally try and load in FTDI D2XX, which doesn't violate GPL, as anyone
+   can provide their own .dll implementing the API, it's a part of the system
+   itself (NOT shipped with OpenOCD), and isn't required for OpenOCD to function
+   */
+#ifdef _WIN32
+
+#include <windows.h>
+#include "ftd2xx.h"
+
+#define D2XX_SUPPORT
+
+#endif // _WIN32
+
 struct mpsse_ctx {
 	struct libusb_context *usb_ctx;
 	struct libusb_device_handle *usb_dev;
+#ifdef D2XX_SUPPORT
+	FT_HANDLE d2xx_dev;
+#endif
 	unsigned int usb_write_timeout;
 	unsigned int usb_read_timeout;
 	uint8_t in_ep;
@@ -149,7 +165,7 @@ static bool device_location_equal(struct libusb_device *device, const char *loca
  * Set any field to 0 as a wildcard. If the device is found true is returned, with ctx containing
  * the already opened handle. ctx->interface must be set to the desired interface (channel) number
  * prior to calling this function. */
-static bool open_matching_device(struct mpsse_ctx *ctx, const uint16_t vids[], const uint16_t pids[],
+static bool open_matching_device_libusb(struct mpsse_ctx *ctx, const uint16_t vids[], const uint16_t pids[],
 	const char *product, const char *serial, const char *location)
 {
 	struct libusb_device **list;
@@ -306,6 +322,249 @@ error:
 	return false;
 }
 
+#ifdef D2XX_SUPPORT
+
+static struct {
+    bool load_ok;
+
+    FT_CreateDeviceInfoList_t FT_CreateDeviceInfoList;
+    FT_Open_t                 FT_Open;
+    FT_Close_t                FT_Close;
+    FT_GetDeviceInfo_t        FT_GetDeviceInfo;
+    FT_Read_t                 FT_Read;
+    FT_Write_t                FT_Write;
+    FT_SetBaudRate_t          FT_SetBaudRate;
+    FT_SetBitMode_t           FT_SetBitMode;
+    FT_GetBitMode_t           FT_GetBitMode;
+    FT_SetLatencyTimer_t      FT_SetLatencyTimer;
+	FT_Purge_t				  FT_Purge;
+} d2xx;
+
+#define LOAD_FN(name) if(!(d2xx.name = (void*)GetProcAddress(dll, #name))) return false;
+
+bool load_d2xx(void) {
+    // already loaded?
+    if(d2xx.load_ok) {
+        return true;
+    }
+
+    HMODULE dll = LoadLibraryA("ftd2xx.dll");
+
+    if(!dll) {
+        return false;
+    }
+
+    LOAD_FN(FT_CreateDeviceInfoList);
+    LOAD_FN(FT_Open);
+    LOAD_FN(FT_Close);
+    LOAD_FN(FT_GetDeviceInfo);
+    LOAD_FN(FT_Read);
+    LOAD_FN(FT_Write);
+    LOAD_FN(FT_SetBaudRate);
+    LOAD_FN(FT_SetBitMode);
+    LOAD_FN(FT_GetBitMode);
+    LOAD_FN(FT_SetLatencyTimer);
+    LOAD_FN(FT_Purge);
+
+    d2xx.load_ok = true;
+    return true;
+}
+
+const char *d2xx_error_name(FT_STATUS status)
+{
+	switch(status) {
+        case FT_OK: return "FT_OK";
+        case FT_INVALID_HANDLE: return "FT_INVALID_HANDLE";
+        case FT_DEVICE_NOT_FOUND: return "FT_DEVICE_NOT_FOUND";
+        case FT_DEVICE_NOT_OPENED: return "FT_DEVICE_NOT_OPENED";
+        case FT_IO_ERROR: return "FT_IO_ERROR";
+        case FT_INSUFFICIENT_RESOURCES: return "FT_INSUFFICIENT_RESOURCES";
+        case FT_INVALID_PARAMETER: return "FT_INVALID_PARAMETER";
+        case FT_INVALID_BAUD_RATE: return "FT_INVALID_BAUD_RATE";
+        case FT_DEVICE_NOT_OPENED_FOR_ERASE: return "FT_DEVICE_NOT_OPENED_FOR_ERASE";
+        case FT_DEVICE_NOT_OPENED_FOR_WRITE: return "FT_DEVICE_NOT_OPENED_FOR_WRITE";
+        case FT_FAILED_TO_WRITE_DEVICE: return "FT_FAILED_TO_WRITE_DEVICE";
+        case FT_EEPROM_READ_FAILED: return "FT_EEPROM_READ_FAILED";
+        case FT_EEPROM_WRITE_FAILED: return "FT_EEPROM_WRITE_FAILED";
+        case FT_EEPROM_ERASE_FAILED: return "FT_EEPROM_ERASE_FAILED";
+        case FT_EEPROM_NOT_PRESENT: return "FT_EEPROM_NOT_PRESENT";
+        case FT_EEPROM_NOT_PROGRAMMED: return "FT_EEPROM_NOT_PROGRAMMED";
+        case FT_INVALID_ARGS: return "FT_INVALID_ARGS";
+        case FT_NOT_SUPPORTED: return "FT_NOT_SUPPORTED";
+        case FT_OTHER_ERROR: return "FT_OTHER_ERROR";
+        case FT_DEVICE_LIST_NOT_READY: return "FT_DEVICE_LIST_NOT_READY";
+        default: return "Unknown error";
+    }
+}
+
+static bool jtag_d2xx_match_ids(DWORD deviceID, const uint16_t vids[], const uint16_t pids[])
+{
+	uint16_t pid = deviceID & 0xFFFF;
+	uint16_t vid = (deviceID >> 16) & 0xFFFF;
+
+	for (unsigned i = 0; vids[i]; i++) {
+		if (vid == vids[i] &&
+			pid == pids[i]) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool open_matching_device_d2xx(struct mpsse_ctx *ctx, const uint16_t vids[], const uint16_t pids[],
+	const char *product, const char *serial, const char *location)
+{
+    DWORD i;
+    FT_HANDLE ftHandle;
+    FT_STATUS status = FT_DEVICE_NOT_FOUND;
+	FT_DEVICE dev;
+    DWORD deviceID;
+    DWORD dev_count;
+	char dev_serial[16];
+	char dev_desc[64];
+
+
+    if(!load_d2xx()) {
+        LOG_INFO("Failed to load FTDI d2xx library, using libusb");
+        return false;
+    }
+
+	if(location) {
+		LOG_INFO("d2xx: Cannot filter by location, using libusb");
+		return false;
+	}
+
+	if(!FT_SUCCESS(d2xx.FT_CreateDeviceInfoList(&dev_count))) {
+		LOG_ERROR("d2xx: FT_CreateDeviceInfoList failed");
+		return false;
+	}
+
+	for(i = 0; i < dev_count; i++) {
+		if(!FT_SUCCESS(status = d2xx.FT_Open(i, &ftHandle))) {
+			continue;
+		}
+
+		if(!FT_SUCCESS(status = d2xx.FT_GetDeviceInfo(
+				ftHandle,
+				&dev,
+				&deviceID,
+				dev_serial,
+				dev_desc,
+				NULL
+				))) {
+			LOG_ERROR("d2xx: FT_GetDeviceInfo failed");
+			d2xx.FT_Close(ftHandle);
+			continue;
+		}
+
+		if (!jtag_d2xx_match_ids(deviceID, vids, pids) ||
+				(product && strcmp(product, dev_desc)) ||
+				(serial && strcmp(serial, dev_serial))) {
+			d2xx.FT_Close(ftHandle);
+			status = FT_DEVICE_NOT_FOUND;
+			continue;
+		}
+
+		break;
+	}
+
+    if(!FT_SUCCESS(status)) {
+        LOG_INFO("No FTDI D2XX devices found, trying libusb\n");
+        return false;
+    }
+
+    ctx->d2xx_dev = ftHandle;
+
+    LOG_INFO("Opened FTDI D2XX device\n");
+
+    return true;
+}
+
+#else
+
+static bool open_matching_device_d2xx(struct mpsse_ctx *ctx, const uint16_t *vid, const uint16_t *pid,
+	const char *product, const char *serial, const char *location)
+{
+	return false;
+}
+
+#endif
+
+/* Helper to open a device that matches vid, pid, product string and/or serial string.
+ * Set any field to 0 as a wildcard. If the device is found true is returned, with ctx containing
+ * the already opened handle. ctx->interface must be set to the desired interface (channel) number
+ * prior to calling this function. */
+static bool open_matching_device(struct mpsse_ctx *ctx, const uint16_t vids[], const uint16_t pids[],
+	const char *product, const char *serial, const char *location)
+{
+	if (open_matching_device_d2xx(ctx, vids, pids, product, serial, location)) {
+		return true;
+	}
+
+	return open_matching_device_libusb(ctx, vids, pids, product, serial, location);
+}
+
+static bool mpsse_set_latency(struct mpsse_ctx *ctx, uint8_t latency)
+{
+	int err;
+
+#ifdef D2XX_SUPPORT
+	FT_STATUS status;
+
+	if (ctx->d2xx_dev) {
+		status = d2xx.FT_SetLatencyTimer(ctx->d2xx_dev, latency);
+		if (!FT_SUCCESS(status)) {
+			LOG_ERROR("unable to set latency timer: %s", d2xx_error_name(status));
+			return false;
+		}
+		return true;
+	}
+#endif
+
+	err = libusb_control_transfer(ctx->usb_dev, FTDI_DEVICE_OUT_REQTYPE,
+			SIO_SET_LATENCY_TIMER_REQUEST, latency, ctx->index, NULL, 0,
+			ctx->usb_write_timeout);
+	if (err < 0) {
+		LOG_ERROR("unable to set latency timer: %s", libusb_error_name(err));
+		return false;
+	}
+
+	return true;
+}
+
+static bool mpsse_set_bitmode(struct mpsse_ctx *ctx, uint8_t pinmask)
+{
+	int err;
+
+#ifdef D2XX_SUPPORT
+	FT_STATUS status;
+
+	if (ctx->d2xx_dev) {
+		status = d2xx.FT_SetBitMode(ctx->d2xx_dev, pinmask, FT_BITMODE_MPSSE);
+		if (!FT_SUCCESS(status)) {
+			LOG_ERROR("unable to set MPSSE bitmode: %s", d2xx_error_name(status));
+			return false;
+		}
+		return true;
+	}
+#endif
+
+	err = libusb_control_transfer(ctx->usb_dev,
+			FTDI_DEVICE_OUT_REQTYPE,
+			SIO_SET_BITMODE_REQUEST,
+			(BITMODE_MPSSE << 8) | pinmask,
+			ctx->index,
+			NULL,
+			0,
+			ctx->usb_write_timeout);
+	if (err < 0) {
+		LOG_ERROR("unable to set MPSSE bitmode: %s", libusb_error_name(err));
+		return false;
+	}
+
+	return true;
+}
+
 struct mpsse_ctx *mpsse_open(const uint16_t vids[], const uint16_t pids[], const char *description,
 	const char *serial, const char *location, int channel)
 {
@@ -352,24 +611,11 @@ struct mpsse_ctx *mpsse_open(const uint16_t vids[], const uint16_t pids[], const
 		goto error;
 	}
 
-	err = libusb_control_transfer(ctx->usb_dev, FTDI_DEVICE_OUT_REQTYPE,
-			SIO_SET_LATENCY_TIMER_REQUEST, 255, ctx->index, NULL, 0,
-			ctx->usb_write_timeout);
-	if (err < 0) {
-		LOG_ERROR("unable to set latency timer: %s", libusb_error_name(err));
+	if (!mpsse_set_latency(ctx, 255)) {
 		goto error;
 	}
 
-	err = libusb_control_transfer(ctx->usb_dev,
-			FTDI_DEVICE_OUT_REQTYPE,
-			SIO_SET_BITMODE_REQUEST,
-			0x0b | (BITMODE_MPSSE << 8),
-			ctx->index,
-			NULL,
-			0,
-			ctx->usb_write_timeout);
-	if (err < 0) {
-		LOG_ERROR("unable to set MPSSE bitmode: %s", libusb_error_name(err));
+	if (!mpsse_set_bitmode(ctx, 0x0b)) {
 		goto error;
 	}
 
@@ -387,6 +633,10 @@ void mpsse_close(struct mpsse_ctx *ctx)
 		libusb_close(ctx->usb_dev);
 	if (ctx->usb_ctx)
 		libusb_exit(ctx->usb_ctx);
+#ifdef D2XX_SUPPORT
+	if (ctx->d2xx_dev)
+		d2xx.FT_Close(ctx->d2xx_dev);
+#endif
 	bit_copy_discard(&ctx->read_queue);
 
 	free(ctx->write_buffer);
@@ -408,6 +658,19 @@ void mpsse_purge(struct mpsse_ctx *ctx)
 	ctx->read_count = 0;
 	ctx->retval = ERROR_OK;
 	bit_copy_discard(&ctx->read_queue);
+
+#ifdef D2XX_SUPPORT
+	FT_STATUS status;
+	if (ctx->d2xx_dev) {
+		status = d2xx.FT_Purge(ctx->d2xx_dev, FT_PURGE_RX | FT_PURGE_TX);
+		if (!FT_SUCCESS(status)) {
+			LOG_ERROR("unable to purge ftdi buffers: %s", d2xx_error_name(status));
+		}
+
+		return;
+	}
+#endif
+
 	err = libusb_control_transfer(ctx->usb_dev, FTDI_DEVICE_OUT_REQTYPE, SIO_RESET_REQUEST,
 			SIO_RESET_PURGE_RX, ctx->index, NULL, 0, ctx->usb_write_timeout);
 	if (err < 0) {
@@ -824,6 +1087,82 @@ static LIBUSB_CALL void write_cb(struct libusb_transfer *transfer)
 	}
 }
 
+#ifdef D2XX_SUPPORT
+static int mpsse_flush_d2xx(struct mpsse_ctx *ctx)
+{
+	FT_STATUS status;
+	DWORD written;
+	DWORD read;
+	DWORD total_written = 0;
+	DWORD total_read = 0;
+	int retval = ctx->retval;
+
+	if (ctx->read_count) {
+		buffer_write_byte(ctx, 0x87); /* SEND_IMMEDIATE */
+		/* delay read transaction to ensure the FTDI chip can support us with data
+		   immediately after processing the MPSSE commands in the write transaction */
+	}
+
+	while (total_written < ctx->write_count &&
+			FT_SUCCESS(status = d2xx.FT_Write(ctx->d2xx_dev, &ctx->write_buffer[total_written],
+			ctx->write_count - total_written, &written))) {
+
+		total_written += written;
+		assert(total_written <= ctx->write_count);
+
+		LOG_DEBUG_IO("transferred %d of %d", (int)total_written, ctx->write_count);
+
+		DEBUG_PRINT_BUF((&ctx->write_buffer[total_written-written]), ((int)written));
+	}
+
+	if (!FT_SUCCESS(status))
+		goto error_check;
+
+	// short circuits if ctx->read_count == 0
+	while (total_read < ctx->read_count &&
+			FT_SUCCESS(status = d2xx.FT_Read(ctx->d2xx_dev, &ctx->read_buffer[total_read],
+			ctx->read_count - total_read, &read))) {
+
+		total_read += read;
+		assert(total_read <= ctx->read_count);
+
+		LOG_DEBUG_IO("read %d of %d", (int)total_read, ctx->read_count);
+
+		DEBUG_PRINT_BUF((&ctx->read_buffer[total_read-read]), ((int)read));
+	}
+
+error_check:
+	if (!FT_SUCCESS(status)) {
+		LOG_ERROR("mpsse_flush_d2xx() failed with %s", d2xx_error_name(status));
+		retval = ERROR_FAIL;
+	} else if (total_written < ctx->write_count) {
+		LOG_ERROR("ftdi device did not accept all data: %d, tried %d",
+			(int)total_written,
+			ctx->write_count);
+		retval = ERROR_FAIL;
+	} else if (total_read < ctx->read_count) {
+		LOG_ERROR("ftdi device did not return all data: %d, expected %d",
+			(int)total_read,
+			ctx->read_count);
+		retval = ERROR_FAIL;
+	} else if (ctx->read_count) {
+		ctx->write_count = 0;
+		ctx->read_count = 0;
+		bit_copy_execute(&ctx->read_queue);
+		retval = ERROR_OK;
+	} else {
+		ctx->write_count = 0;
+		bit_copy_discard(&ctx->read_queue);
+		retval = ERROR_OK;
+	}
+
+	if (retval != ERROR_OK)
+		mpsse_purge(ctx);
+
+	return retval;
+}
+#endif
+
 int mpsse_flush(struct mpsse_ctx *ctx)
 {
 	int retval = ctx->retval;
@@ -841,6 +1180,12 @@ int mpsse_flush(struct mpsse_ctx *ctx)
 
 	if (ctx->write_count == 0)
 		return retval;
+
+#ifdef D2XX_SUPPORT
+	if (ctx->d2xx_dev) {
+		return mpsse_flush_d2xx(ctx);
+	}
+#endif
 
 	struct libusb_transfer *read_transfer = NULL;
 	struct transfer_result read_result = { .ctx = ctx, .done = true };
