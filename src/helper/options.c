@@ -66,7 +66,16 @@ static char *find_exe_path(void)
 		exepath = malloc(MAX_PATH);
 		if (!exepath)
 			break;
-		GetModuleFileName(NULL, exepath, MAX_PATH);
+		GetModuleFileNameA(NULL, exepath, MAX_PATH);
+
+		/* If openocd was launched with an extended path (one starting with \\?\),
+		 * we need to strip it off because it disables expansion of the special
+		 * directories '.' and '..', which are used when adding search paths.
+		 * Note: this "breaks" UNC paths, but they were already broken due to
+		 * the lack of '.' and '..' expansion */
+		if (strncmp(exepath, "\\\\?\\", 4) == 0) {
+			memmove(exepath, &exepath[4], MAX_PATH - 4);
+		}
 
 		/* Convert path separators to UNIX style, should work on Windows also. */
 		for (char *p = exepath; *p; p++) {
